@@ -5,6 +5,14 @@ import { Server } from "socket.io";
 import { createWorker, createRouter } from "./sfu";
 import { Peer } from "./peer";
 import { Router, WebRtcTransport } from "mediasoup/node/lib/types";
+import {
+  startFfmpegForAudio,
+  startFfmpegForHls,
+  writeAudioSdpFile,
+  writeMasterPlaylist,
+  writeSdpFile,
+} from "./hls";
+import path from "path";
 
 const app = express();
 const server = http.createServer(app);
@@ -12,6 +20,7 @@ const io = new Server(server, { cors: { origin: "*" } });
 
 app.use(cors());
 app.use(express.json());
+app.use("/live", express.static(path.join(__dirname, "public", "live")));
 
 let router: Router;
 const peers = new Map<string, Peer>();
@@ -45,6 +54,37 @@ function informPeers(newProducerId: string, excludeSocketId: string) {
       peer.emit("newProducer", { producerId: newProducerId });
     }
   }
+}
+
+async function createVideoPlainTransport() {
+  const videoPlainTransport = await router.createPlainTransport({
+    listenIp: "127.0.0.1",
+    rtcpMux: false,
+    comedia: false,
+  });
+
+  await videoPlainTransport.connect({
+    ip: "127.0.0.1",
+    port: 5004,
+    rtcpPort: 5005,
+  });
+
+  return videoPlainTransport;
+}
+
+async function createAudioPlainTransport() {
+  const audioPlainTransport = await router.createPlainTransport({
+    listenIp: "127.0.0.1",
+    rtcpMux: false,
+    comedia: false,
+  });
+  await audioPlainTransport.connect({
+    ip: "127.0.0.1",
+    port: 5006,
+    rtcpPort: 5007,
+  });
+
+  return audioPlainTransport;
 }
 
 io.on("connection", (socket) => {
@@ -127,6 +167,58 @@ io.on("connection", (socket) => {
           paused: false,
         });
       });
+
+      if (producer.kind === "audio") {
+        try {
+          const plainAudioTransport = await createAudioPlainTransport();
+
+          const audioConsumer = await plainAudioTransport.consume({
+            producerId: producer.id,
+            rtpCapabilities: router.rtpCapabilities,
+            paused: false,
+          });
+
+          // Wait for SDP file to be written
+          await writeAudioSdpFile(socket.id, audioConsumer.rtpParameters);
+
+          const ffmpegProcess = startFfmpegForAudio(socket.id);
+
+          // Store references for cleanup
+          peer.plainAudioTransport = plainAudioTransport;
+          peer.audioConsumer = audioConsumer;
+          peer.audioProcess = ffmpegProcess;
+        } catch (error) {
+          console.error("❌ Error setting up audio HLS streaming:", error);
+        }
+      }
+
+      if (producer.kind === "video") {
+        try {
+          const plainVideoTransport = await createVideoPlainTransport();
+
+          const videoConsumer = await plainVideoTransport.consume({
+            producerId: producer.id,
+            rtpCapabilities: router.rtpCapabilities,
+            paused: false,
+          });
+
+          // Wait for SDP file to be written
+          await writeSdpFile(socket.id, videoConsumer.rtpParameters);
+
+          const ffmpegProcess = startFfmpegForHls(socket.id);
+
+          // Store references for cleanup
+          peer.videoProcess = ffmpegProcess;
+          peer.plainVideoTransport = plainVideoTransport;
+          peer.videoConsumer = videoConsumer;
+        } catch (error) {
+          console.error("❌ Error setting up video HLS streaming:", error);
+        }
+      }
+
+      if (peer.audioProcess && peer.videoProcess) {
+        writeMasterPlaylist(peer.id);
+      }
 
       informPeers(producer.id, socket.id);
       callback({ id: producer.id });

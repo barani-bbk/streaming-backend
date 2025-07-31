@@ -1,4 +1,9 @@
-import { Producer, Consumer, WebRtcTransport } from "mediasoup/node/lib/types";
+import {
+  Producer,
+  Consumer,
+  WebRtcTransport,
+  PlainTransport,
+} from "mediasoup/node/lib/types";
 import { Socket } from "socket.io";
 
 export class Peer {
@@ -9,6 +14,14 @@ export class Peer {
   private _consumers: Map<string, Consumer>;
   private _producers: Map<string, Producer>;
 
+  // Add references for HLS streaming
+  public plainVideoTransport: PlainTransport | null;
+  public plainAudioTransport: PlainTransport | null;
+  public videoConsumer: Consumer | null;
+  public audioConsumer: Consumer | null;
+  public audioProcess: any | null;
+  public videoProcess: any | null;
+
   constructor(socket: Socket) {
     this._socketId = socket.id;
     this.socket = socket;
@@ -16,6 +29,12 @@ export class Peer {
     this._recvTransport = null;
     this._consumers = new Map();
     this._producers = new Map();
+
+    // Initialize HLS references
+    this.plainVideoTransport = null;
+    this.plainAudioTransport = null;
+    this.videoConsumer = null;
+    this.audioConsumer = null;
   }
 
   addProducer(producer: Producer) {
@@ -66,13 +85,23 @@ export class Peer {
   }
 
   close() {
+    // Close WebRTC transports
     this.sendTransport?.close();
     this.recvTransport?.close();
 
+    // Close Plain transports for HLS
+    this.plainVideoTransport?.close();
+    this.plainAudioTransport?.close();
+
+    // Close producers and consumers
     this.producers.forEach((producer) => producer.close());
     this.producers.clear();
 
     this.consumers.forEach((consumer) => consumer.close());
     this.consumers.clear();
+
+    // Close HLS consumers
+    this.videoConsumer?.close();
+    this.audioConsumer?.close();
   }
 }
