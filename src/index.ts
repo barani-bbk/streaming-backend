@@ -1,10 +1,9 @@
 import cors from "cors";
 import express from "express";
 import http from "http";
-import { Server } from "socket.io";
-import { createWorker, createRouter } from "./sfu";
-import { Peer } from "./peer";
 import { Router, WebRtcTransport } from "mediasoup/node/lib/types";
+import path from "path";
+import { Server } from "socket.io";
 import {
   startFfmpegForAudio,
   startFfmpegForHls,
@@ -12,7 +11,9 @@ import {
   writeMasterPlaylist,
   writeSdpFile,
 } from "./hls";
-import path from "path";
+import { Peer } from "./peer";
+import { portManager } from "./portManager";
+import { createRouter, createWorker } from "./sfu";
 
 const app = express();
 const server = http.createServer(app);
@@ -24,6 +25,36 @@ app.use("/live", express.static(path.join(__dirname, "public", "live")));
 
 let router: Router;
 const peers = new Map<string, Peer>();
+const sseClients = new Set<(event: string, data: any) => void>();
+
+function broadcastSSE(event: string, data: any) {
+  for (const send of sseClients) {
+    send(event, data);
+  }
+}
+
+app.get("/api/live-streams", (req, res) => {
+  res.setHeader("Content-Type", "text/event-stream");
+  res.setHeader("Cache-Control", "no-cache");
+  res.setHeader("Connection", "keep-alive");
+  res.flushHeaders();
+
+  const send = (event: string, data: any) => {
+    res.write(`event: ${event}\n`);
+    res.write(`data: ${JSON.stringify(data)}\n\n`);
+  };
+
+  sseClients.add(send);
+
+  const livePeers = Array.from(peers.values()).map((peer) => ({
+    peerId: peer.id,
+  }));
+  send("init", { livePeers });
+
+  req.on("close", () => {
+    sseClients.delete(send);
+  });
+});
 
 async function startMediasoup() {
   const worker = await createWorker();
@@ -56,35 +87,79 @@ function informPeers(newProducerId: string, excludeSocketId: string) {
   }
 }
 
-async function createVideoPlainTransport() {
-  const videoPlainTransport = await router.createPlainTransport({
+async function createPlainTransport() {
+  const port = await portManager.getAvailablePort();
+  const rtcpPort = await portManager.getAvailablePort();
+
+  const plainTransport = await router.createPlainTransport({
     listenIp: "127.0.0.1",
     rtcpMux: false,
     comedia: false,
   });
 
-  await videoPlainTransport.connect({
+  await plainTransport.connect({
     ip: "127.0.0.1",
-    port: 5004,
-    rtcpPort: 5005,
+    port: port,
+    rtcpPort: rtcpPort,
   });
 
-  return videoPlainTransport;
+  return { plainTransport, port, rtcpPort };
 }
 
-async function createAudioPlainTransport() {
-  const audioPlainTransport = await router.createPlainTransport({
-    listenIp: "127.0.0.1",
-    rtcpMux: false,
-    comedia: false,
-  });
-  await audioPlainTransport.connect({
-    ip: "127.0.0.1",
-    port: 5006,
-    rtcpPort: 5007,
+async function startHlsForPeer(
+  peer: Peer,
+  videoProducerId: string,
+  audioProducerId: string
+) {
+  const {
+    plainTransport: videoTransport,
+    port: videoPort,
+    rtcpPort: videoRtcpPort,
+  } = await createPlainTransport();
+  peer.plainVideoTransport = videoTransport;
+
+  const {
+    plainTransport: audioTransport,
+    port: audioPort,
+    rtcpPort: audioRtcpPort,
+  } = await createPlainTransport();
+  peer.plainAudioTransport = audioTransport;
+
+  const videoConsumer = await peer.plainVideoTransport.consume({
+    producerId: videoProducerId,
+    rtpCapabilities: router.rtpCapabilities,
+    paused: false,
   });
 
-  return audioPlainTransport;
+  const audioConsumer = await peer.plainAudioTransport.consume({
+    producerId: audioProducerId,
+    rtpCapabilities: router.rtpCapabilities,
+    paused: false,
+  });
+
+  peer.videoConsumer = videoConsumer;
+  peer.audioConsumer = audioConsumer;
+
+  await writeSdpFile(
+    peer.id,
+    videoConsumer.rtpParameters,
+    videoPort,
+    videoRtcpPort
+  );
+  await writeAudioSdpFile(
+    peer.id,
+    audioConsumer.rtpParameters,
+    audioPort,
+    audioRtcpPort
+  );
+
+  peer.videoProcess = startFfmpegForHls(peer.id);
+  peer.audioProcess = startFfmpegForAudio(peer.id);
+
+  setTimeout(() => {
+    writeMasterPlaylist(peer.id);
+    broadcastSSE("peerLive", { peerId: peer.id });
+  }, 3000);
 }
 
 io.on("connection", (socket) => {
@@ -99,6 +174,7 @@ io.on("connection", (socket) => {
     io.emit("peerLeft", { peerId: socket.id });
     peer.close();
     peers.delete(socket.id);
+    broadcastSSE("peerLeft", { peerId: socket.id });
   });
 
   socket.on("joinRoom", (_, callback) => {
@@ -168,52 +244,24 @@ io.on("connection", (socket) => {
         });
       });
 
-      if (producer.kind === "audio") {
-        try {
-          const plainAudioTransport = await createAudioPlainTransport();
+      if (
+        peer.producers.size === 2 &&
+        !peer.videoProcess &&
+        !peer.audioProcess
+      ) {
+        let videoProducerId;
+        let audioProducerId;
 
-          const audioConsumer = await plainAudioTransport.consume({
-            producerId: producer.id,
-            rtpCapabilities: router.rtpCapabilities,
-            paused: false,
-          });
-
-          // Wait for SDP file to be written
-          await writeAudioSdpFile(socket.id, audioConsumer.rtpParameters);
-
-          const ffmpegProcess = startFfmpegForAudio(socket.id);
-
-          // Store references for cleanup
-          peer.plainAudioTransport = plainAudioTransport;
-          peer.audioConsumer = audioConsumer;
-          peer.audioProcess = ffmpegProcess;
-        } catch (error) {
-          console.error("❌ Error setting up audio HLS streaming:", error);
-        }
-      }
-
-      if (producer.kind === "video") {
-        try {
-          const plainVideoTransport = await createVideoPlainTransport();
-
-          const videoConsumer = await plainVideoTransport.consume({
-            producerId: producer.id,
-            rtpCapabilities: router.rtpCapabilities,
-            paused: false,
-          });
-
-          // Wait for SDP file to be written
-          await writeSdpFile(socket.id, videoConsumer.rtpParameters);
-
-          const ffmpegProcess = startFfmpegForHls(socket.id);
-
-          // Store references for cleanup
-          peer.videoProcess = ffmpegProcess;
-          peer.plainVideoTransport = plainVideoTransport;
-          peer.videoConsumer = videoConsumer;
-        } catch (error) {
-          console.error("❌ Error setting up video HLS streaming:", error);
-        }
+        peer.producers.forEach((producer) => {
+          if (producer.kind === "video") {
+            videoProducerId = producer.id;
+          }
+          if (producer.kind === "audio") {
+            audioProducerId = producer.id;
+          }
+        });
+        if (!videoProducerId || !audioProducerId) return;
+        startHlsForPeer(peer, videoProducerId, audioProducerId);
       }
 
       if (peer.audioProcess && peer.videoProcess) {

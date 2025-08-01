@@ -103,5 +103,19 @@ export class Peer {
     // Close HLS consumers
     this.videoConsumer?.close();
     this.audioConsumer?.close();
+
+    console.log("\n\n\n\n\n\n\n\n", "closed------------------");
+
+    if (this.videoProcess) {
+      this.videoProcess.kill("SIGTERM");
+    }
+    if (this.audioProcess) {
+      this.audioProcess.kill("SIGTERM");
+    }
+
+    setTimeout(() => {
+      if (this.videoProcess) this.videoProcess.kill("SIGKILL");
+      if (this.audioProcess) this.audioProcess.kill("SIGKILL");
+    }, 5000);
   }
 }
