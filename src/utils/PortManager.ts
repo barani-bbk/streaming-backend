@@ -1,4 +1,5 @@
 import net from "net";
+import { logger } from "./Logger";
 
 class PortManager {
   private usedPorts = new Set<number>();
@@ -13,12 +14,13 @@ class PortManager {
   async getAvailablePort(): Promise<number> {
     for (let port = this.minPort; port <= this.maxPort; port++) {
       if (!this.usedPorts.has(port)) {
-        const available = await this.isPortAvailable(port);
-        if (available) {
+        const isAvailable = await this.isPortAvailable(port);
+        if (isAvailable) {
           this.usedPorts.add(port);
-          console.log(
-            `✅ Allocated port ${port}. Used ports:`,
-            Array.from(this.usedPorts)
+          logger.debug(
+            `Allocated port ${port}. Used ports: [${Array.from(
+              this.usedPorts
+            ).join(", ")}]`
           );
           return port;
         }
@@ -30,18 +32,21 @@ class PortManager {
   }
 
   releasePort(port: number): void {
-    this.usedPorts.delete(port);
-    console.log(
-      `🔄 Released port ${port}. Used ports:`,
-      Array.from(this.usedPorts)
-    );
+    if (this.usedPorts.has(port)) {
+      this.usedPorts.delete(port);
+      logger.debug(
+        `Released port ${port}. Used ports: [${Array.from(this.usedPorts).join(
+          ", "
+        )}]`
+      );
+    }
   }
 
-  private async isPortAvailable(port: number): Promise<boolean> {
+  private isPortAvailable(port: number): Promise<boolean> {
     return new Promise((resolve) => {
       const server = net.createServer();
 
-      server.once("error", (err: any) => {
+      server.once("error", () => {
         resolve(false);
       });
 
@@ -51,22 +56,13 @@ class PortManager {
         });
       });
 
-      const timeout = setTimeout(() => {
-        server.close();
-        resolve(false);
-      }, 1000);
-
-      server.listen(port, "127.0.0.1", () => {
-        clearTimeout(timeout);
-      });
+      server.listen(port, "127.0.0.1");
     });
   }
 
-  getUsedPorts(): number[] {
+  public getUsedPorts(): number[] {
     return Array.from(this.usedPorts);
   }
 }
 
-const portManager = new PortManager(6000, 7000);
-
-export { portManager };
+export const portManager = new PortManager();
